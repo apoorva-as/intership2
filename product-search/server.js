@@ -2,37 +2,53 @@ const express = require("express");
 const cors = require("cors");
 const fetch = require("node-fetch");
 const { URL } = require("url");
+const { promisify } = require("util");
+const mysql = require("mysql2");
+const cloudinary = require("cloudinary").v2;
 require("dotenv").config();
 
 const app = express();
 app.use(cors());
 
-const SERPAPI_KEY = process.env.SERPAPI_KEY; // <-- Replace with your SerpAPI key
+const SERPAPI_KEY = process.env.SERPAPI_KEY;
+const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
+const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
+const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
+
+const hasValidCloudName = /^[a-z0-9_-]+$/i.test(String(CLOUDINARY_CLOUD_NAME || ""));
+const isCloudinaryConfigured = Boolean(
+  CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET && hasValidCloudName
+);
+
+if (isCloudinaryConfigured) {
+  cloudinary.config({
+    cloud_name: CLOUDINARY_CLOUD_NAME,
+    api_key: CLOUDINARY_API_KEY,
+    api_secret: CLOUDINARY_API_SECRET
+  });
+}
+
+// ✅ DB CONNECTION (ONLY ONCE)
+const db = mysql.createConnection({
+  host: "localhost",
+  user: "root",
+  password: process.env.DB_PASSWORD,
+  database: "product_images",
+  port: 3307
+});
+
+const dbQuery = promisify(db.query).bind(db);
+
+db.connect((err) => {
+  if (err) console.error("DB connection failed:", err);
+  else console.log("Connected to MySQL");
+});
+
+// ---------------- UTIL FUNCTIONS ----------------
 
 const STOP_WORDS = new Set([
-  "a",
-  "an",
-  "the",
-  "and",
-  "or",
-  "for",
-  "with",
-  "from",
-  "to",
-  "of",
-  "in",
-  "on",
-  "at",
-  "by",
-  "image",
-  "images",
-  "photo",
-  "photos",
-  "picture",
-  "pictures",
-  "view",
-  "official",
-  "product"
+  "a","an","the","and","or","for","with","from","to","of","in","on","at","by",
+  "image","images","photo","photos","picture","pictures","view","official","product"
 ]);
 
 function tokenize(text) {
@@ -44,259 +60,133 @@ function tokenize(text) {
 }
 
 function getDomain(value) {
-  if (!value) return "unknown";
-
   try {
     return new URL(value).hostname.replace(/^www\./, "").toLowerCase();
   } catch {
-    return String(value).replace(/^www\./, "").toLowerCase();
+    return "unknown";
   }
 }
 
-function jaccardSimilarity(tokensA, tokensB) {
-  if (!tokensA.length || !tokensB.length) return 0;
-
-  const setA = new Set(tokensA);
-  const setB = new Set(tokensB);
-  let intersectionSize = 0;
-
-  for (const token of setA) {
-    if (setB.has(token)) intersectionSize += 1;
-  }
-
-  const unionSize = new Set([...setA, ...setB]).size;
-  return unionSize === 0 ? 0 : intersectionSize / unionSize;
-}
-
-function hasWhiteBackgroundHint(text) {
-  return /white background|isolated|studio shot|catalog|packshot/.test(
-    String(text || "").toLowerCase()
-  );
-}
-
-function hasLifestyleHint(text) {
-  return /review|hands on|in use|lifestyle|people|model|room|outdoor/.test(
-    String(text || "").toLowerCase()
-  );
+function jaccardSimilarity(a, b) {
+  const setA = new Set(a);
+  const setB = new Set(b);
+  let intersection = 0;
+  for (const x of setA) if (setB.has(x)) intersection++;
+  return intersection / new Set([...setA, ...setB]).size || 0;
 }
 
 function detectAngle(text) {
-  const normalized = String(text || "").toLowerCase();
-
-  if (/\bfront\b/.test(normalized)) return "front";
-  if (/\bside\b|\bprofile\b/.test(normalized)) return "side";
-  if (/\btop\b|\boverhead\b/.test(normalized)) return "top";
-  if (/\bback\b/.test(normalized)) return "back";
-
+  text = String(text).toLowerCase();
+  if (text.includes("front")) return "front";
+  if (text.includes("side")) return "side";
+  if (text.includes("top")) return "top";
+  if (text.includes("back")) return "back";
   return null;
 }
 
-function normalizeAngleNeutralTokens(text) {
-  const angleWords = new Set([
-    "front",
-    "side",
-    "profile",
-    "top",
-    "back",
-    "view",
-    "angle"
-  ]);
-
-  return tokenize(text).filter((token) => !angleWords.has(token));
+function slugify(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "unknown-product";
 }
 
-function isDuplicateLooking(item, selectedItems) {
-  const currentTokens = normalizeAngleNeutralTokens(`${item.title} ${item.altText}`);
-  if (!currentTokens.length) return false;
+let cloudinaryWarningShown = false;
 
-  for (const selectedItem of selectedItems) {
-    const selectedTokens = normalizeAngleNeutralTokens(
-      `${selectedItem.title} ${selectedItem.altText}`
-    );
-    const similarity = jaccardSimilarity(currentTokens, selectedTokens);
+async function uploadToCloudinary(imageUrl, productName = "misc") {
+  if (!imageUrl) return null;
 
-    // Very high overlap usually means the listing is the same repeated shot.
-    if (similarity >= 0.92) {
-      return true;
+  if (!isCloudinaryConfigured) {
+    if (!cloudinaryWarningShown) {
+      cloudinaryWarningShown = true;
+      console.warn("Cloudinary is not configured correctly. Using original image URLs as fallback.");
     }
+    return null;
   }
 
-  return false;
-}
-
-function pickBestCandidate(list, usedUrls, selectedItems, allowSimilar = false) {
-  for (const item of list) {
-    if (usedUrls.has(item.imageUrl)) continue;
-    if (!allowSimilar && isDuplicateLooking(item, selectedItems)) continue;
-    return item;
+  try {
+    const uploaded = await cloudinary.uploader.upload(imageUrl, {
+      folder: `products/${slugify(productName)}`
+    });
+    return uploaded?.secure_url || null;
+  } catch (error) {
+    console.error("Cloudinary upload failed:", error.message);
+    return null;
   }
-
-  return null;
 }
+
+// ---------------- MAIN API ----------------
 
 app.get("/api/search", async (req, res) => {
   const objectName = req.query.q;
+
   if (!objectName) {
-    return res.status(400).json({ error: "Missing query parameter: q" });
+    return res.status(400).json({ error: "Missing query" });
   }
 
-  // One query only, as requested.
-  const query = `${objectName} product images multiple angles white background`;
-  const url = `https://serpapi.com/search.json?engine=google_images&q=${encodeURIComponent(query)}&num=20&api_key=${SERPAPI_KEY}`;
-
   try {
+    // ✅ STEP 1: CHECK DB FIRST (CACHE)
+    const results = await dbQuery("SELECT * FROM images WHERE name = ?", [objectName]);
+    if (results.length > 0) {
+      console.log("⚡ Fetched from DB");
+      return res.json(results[0]);
+    }
+
+    console.log("🌐 Fetching from API...");
+
+    const query = `${objectName} product multiple angles white background`;
+    const url = `https://serpapi.com/search.json?engine=google_images&q=${encodeURIComponent(query)}&num=20&api_key=${SERPAPI_KEY}`;
+
     const response = await fetch(url);
     const data = await response.json();
 
-    // Step 1: pull 10-15+ candidates from SerpAPI (we request up to 20).
-    const rawImages = Array.isArray(data.images_results)
-      ? data.images_results.slice(0, 20)
-      : [];
+    const images = (data.images_results || []).slice(0, 20);
 
-    const candidates = rawImages
-      .map((item) => {
-        const imageUrl = item.original || item.thumbnail || null;
-        const title = item.title || "";
-        const altText = item.snippet || item.original_title || "";
-        const source = item.source || "";
-        const sourceDomain = getDomain(item.link || source);
-        const tokens = tokenize(title);
-        const angle = detectAngle(`${title} ${altText}`);
+    const candidates = images.map((item) => ({
+      url: item.original || item.thumbnail,
+      text: `${item.title} ${item.snippet}`,
+      angle: detectAngle(`${item.title} ${item.snippet}`)
+    }));
 
-        return {
-          imageUrl,
-          title,
-          altText,
-          source,
-          sourceDomain,
-          angle,
-          tokens,
-          textForHints: `${title} ${altText} ${source}`
-        };
-      })
-      .filter((item) => item.imageUrl);
-
-    if (!candidates.length) {
-      return res.json({ front: null, side: null, top: null, back: null });
-    }
-
-    const objectTokens = tokenize(objectName);
-
-    // Step 2a: frequency maps for "similar titles" and "similar domains".
-    const domainFrequency = {};
-    const tokenFrequency = {};
+    const result = { front: null, side: null, top: null, back: null };
 
     for (const item of candidates) {
-      domainFrequency[item.sourceDomain] = (domainFrequency[item.sourceDomain] || 0) + 1;
+      if (!item.url) continue;
+      if (!result[item.angle]) result[item.angle] = item.url;
+    }
 
-      for (const token of item.tokens) {
-        tokenFrequency[token] = (tokenFrequency[token] || 0) + 1;
+    // fallback
+    for (const key of ["front", "side", "top", "back"]) {
+      if (!result[key]) {
+        const fallback = candidates.find((c) => c.url);
+        result[key] = fallback?.url || null;
       }
     }
 
-    // Step 2b: first-pass score by title similarity, domain consistency, and clean-background hints.
-    const firstPass = candidates.map((item) => {
-      let titleSimilarityScore = 0;
-      for (const token of item.tokens) {
-        titleSimilarityScore += tokenFrequency[token] || 0;
-      }
-
-      const domainSimilarityScore = (domainFrequency[item.sourceDomain] || 0) * 5;
-      const objectMatchScore = objectTokens.filter((token) => item.tokens.includes(token)).length * 4;
-      const whiteBackgroundScore = hasWhiteBackgroundHint(item.textForHints) ? 8 : 0;
-      const lifestylePenalty = hasLifestyleHint(item.textForHints) ? -6 : 0;
-
-      return {
-        ...item,
-        firstPassScore:
-          titleSimilarityScore +
-          domainSimilarityScore +
-          objectMatchScore +
-          whiteBackgroundScore +
-          lifestylePenalty
-      };
-    });
-
-    firstPass.sort((a, b) => b.firstPassScore - a.firstPassScore);
-
-    // Use best item as anchor so we keep images likely from the same exact product.
-    const anchor = firstPass[0];
-
-    // Step 2c: second-pass score adds title overlap and same-domain bonus vs anchor image.
-    const secondPass = firstPass.map((item) => {
-      const similarityToAnchor = jaccardSimilarity(item.tokens, anchor.tokens);
-      const sameDomainAsAnchor = item.sourceDomain === anchor.sourceDomain ? 6 : 0;
-
-      return {
-        ...item,
-        finalScore: item.firstPassScore + similarityToAnchor * 20 + sameDomainAsAnchor
-      };
-    });
-
-    secondPass.sort((a, b) => b.finalScore - a.finalScore);
-
-    // Step 3: bucket by detected angle so we can prioritize diversity.
-    const angleBuckets = {
-      front: [],
-      side: [],
-      top: [],
-      back: [],
-      unknown: []
+    const uploadedResult = {
+      front: (await uploadToCloudinary(result.front, objectName)) || result.front,
+      side: (await uploadToCloudinary(result.side, objectName)) || result.side,
+      top: (await uploadToCloudinary(result.top, objectName)) || result.top,
+      back: (await uploadToCloudinary(result.back, objectName)) || result.back
     };
 
-    for (const item of secondPass) {
-      if (item.angle && angleBuckets[item.angle]) {
-        angleBuckets[item.angle].push(item);
-      } else {
-        angleBuckets.unknown.push(item);
-      }
-    }
+    // ✅ STEP 2: SAVE TO DB (CLOUDINARY URLS WITH FALLBACK)
+    await dbQuery(
+      "INSERT INTO images (name, front, side, top, back) VALUES (?, ?, ?, ?, ?)",
+      [objectName, uploadedResult.front, uploadedResult.side, uploadedResult.top, uploadedResult.back]
+    );
+    console.log("💾 Saved to DB");
 
-    // Step 4: select one image per angle first, then fallback if a bucket is empty.
-    const result = { front: null, side: null, top: null, back: null };
-    const selectedItems = [];
-    const usedUrls = new Set();
-    const targetAngles = ["front", "side", "top", "back"];
-
-    for (const angle of targetAngles) {
-      let picked = pickBestCandidate(angleBuckets[angle], usedUrls, selectedItems);
-
-      // If all candidates looked too similar, allow the best remaining one.
-      if (!picked) {
-        picked = pickBestCandidate(angleBuckets[angle], usedUrls, selectedItems, true);
-      }
-
-      if (picked) {
-        result[angle] = picked.imageUrl;
-        selectedItems.push(picked);
-        usedUrls.add(picked.imageUrl);
-      }
-    }
-
-    // Fallback: fill missing angles from any remaining candidates.
-    const fallbackPool = [...angleBuckets.unknown, ...secondPass];
-
-    for (const angle of targetAngles) {
-      if (result[angle]) continue;
-
-      let picked = pickBestCandidate(fallbackPool, usedUrls, selectedItems);
-      if (!picked) {
-        picked = pickBestCandidate(fallbackPool, usedUrls, selectedItems, true);
-      }
-
-      if (picked) {
-        result[angle] = picked.imageUrl;
-        selectedItems.push(picked);
-        usedUrls.add(picked.imageUrl);
-      }
-    }
-
-    res.json(result);
+    // ✅ STEP 3: SEND RESPONSE
+    return res.json(uploadedResult);
   } catch (err) {
-    console.error("Error fetching images:", err.message);
-    res.status(500).json({ error: "Failed to fetch product images" });
+    console.error("API Error:", err.message);
+    return res.status(500).json({ error: "Failed to fetch images" });
   }
 });
+
+
+// ---------------- SERVER ----------------
 
 const PORT = 3001;
 app.listen(PORT, () => {
